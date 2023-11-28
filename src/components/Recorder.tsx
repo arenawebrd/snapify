@@ -10,13 +10,14 @@ import axios from "axios";
 import dayjs from "dayjs";
 import { useRouter } from "next/router";
 import { api } from "~/utils/api";
-import fixWebmDuration from "fix-webm-duration";
 import { TRPCClientError } from "@trpc/client";
-import { useAtom } from "jotai/index";
+import { useAtom } from "jotai";
 import paywallAtom from "~/atoms/paywallAtom";
 import recordVideoModalOpen from "~/atoms/recordVideoModalOpen";
 import { usePostHog } from "posthog-js/react";
 import Tooltip from "~/components/Tooltip";
+import generateThumbnail from "~/utils/generateThumbnail";
+import * as EBML from "ts-ebml";
 
 interface Props {
   closeModal: () => void;
@@ -102,17 +103,43 @@ export default function Recorder({ closeModal, step, setStep }: Props) {
     posthog?.capture("recorder: start video recording");
   };
 
+  function getSeekableBlob(inputBlob: Blob, callback: (blob: Blob) => void) {
+    const reader = new EBML.Reader();
+    const decoder = new EBML.Decoder();
+    const tools = EBML.tools;
+
+    const fileReader = new FileReader();
+    fileReader.onload = function (e) {
+      if (!this.result || typeof this.result === "string") return;
+      const ebmlElms = decoder.decode(this.result);
+      ebmlElms.forEach(function (element) {
+        reader.read(element);
+      });
+      reader.stop();
+
+      const refinedMetadataBuf = tools.makeMetadataSeekable(
+        reader.metadatas,
+        duration * 1000,
+        reader.cues
+      );
+
+      const body = this.result.slice(reader.metadataSize);
+      const newBlob = new Blob([refinedMetadataBuf, body], {
+        type: "video/webm",
+      });
+
+      callback(newBlob);
+    };
+    fileReader.readAsArrayBuffer(inputBlob);
+  }
+
   const handleStop = () => {
     if (recorderRef.current === null) return;
     recorderRef.current.stopRecording(() => {
       if (recorderRef.current) {
-        fixWebmDuration(
-          recorderRef.current.getBlob(),
-          duration * 1000,
-          (seekableBlob) => {
-            setBlob(seekableBlob);
-          }
-        );
+        getSeekableBlob(recorderRef.current.getBlob(), function (fixedBlob) {
+          setBlob(fixedBlob);
+        });
         steam?.getTracks().map((track) => track.stop());
       }
     });
@@ -178,16 +205,6 @@ export default function Recorder({ closeModal, step, setStep }: Props) {
     }
 
     posthog?.capture("recorder: video downloaded");
-  };
-
-  const generateThumbnail = async (video: HTMLVideoElement) => {
-    const canvas = document.createElement("canvas");
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    canvas
-      .getContext("2d")
-      ?.drawImage(video, 0, 0, canvas.width, canvas.height);
-    return await new Promise((resolve) => canvas.toBlob(resolve));
   };
 
   const handleUpload = async () => {
